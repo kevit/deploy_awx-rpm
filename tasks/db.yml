@@ -1,0 +1,101 @@
+---
+- name: Activate Satellite repositories
+  rhsm_repository:
+    name: "{{ item }}"
+    state: enabled
+  with_items:
+    - rhel-server-rhscl-7-rpms
+
+- name: Install PostgreSQL
+  yum:
+    name: rh-postgresql10
+    state: present
+
+- name: Install python psycopg2 module
+  yum:
+    name: python-psycopg2
+    state: present
+
+- name: Unmount DB data volume from default location
+  mount:
+    path: "{{ default_db_disk_mount }}"
+    src: "{{ db_disk_src }}"
+    fstype: "{{ db_disk_fs_type }}"
+    state: absent
+
+- name: Mount /data volume to PostgreSQL directory
+  mount:
+    path: /var/lib/pgsql
+    src: "{{ db_disk_src }}"
+    fstype: "{{ db_disk_fs_type }}"
+    state: present
+- name: Check if PostgreSQL data directory is empty
+  find:
+    paths: "/var/opt/rh/rh-postgresql10/lib/pgsql/data"
+    patterns: "[A-Za-z0-9_-]+"
+    use_regex: True
+    file_type: any
+    recurse: yes
+  register: postgresql_directory
+
+- name: Initialize DB
+  shell: scl enable rh-postgresql10 "postgresql-setup initdb"
+  register: initdb
+  ignore_errors: True
+  when: postgresql_directory.matched == 0
+
+- name: Start & enable PostgreSQL service at boot
+  service:
+    name: rh-postgresql10-postgresql
+    state: started
+    enabled: yes
+
+- name: Edit PostgreSQL configuration to trust AWX servers remote connections
+  lineinfile:
+    path: /var/opt/rh/rh-postgresql10/lib/pgsql/data/pg_hba.conf
+    regexp: "^host    all             all             {{ hostvars[item]['ansible_default_ipv4']['address'] }}/32            trust$"
+    insertafter: '# IPv4 local connections:'
+    line: "host    all             all             {{ hostvars[item]['ansible_default_ipv4']['address'] }}/32            trust"
+  with_items: "{{ groups['nodes'] }}"
+
+- name: Edit PostgreSQL configuration file to listen to all addresses
+  lineinfile:
+    path: /var/opt/rh/rh-postgresql10/lib/pgsql/data/postgresql.conf
+    regexp: '^listen_addresses'
+    line: "listen_addresses = '*'"
+    state: present
+
+- name: Edit PostgreSQL configuration file to configure default port
+  lineinfile:
+    path: /var/opt/rh/rh-postgresql10/lib/pgsql/data/postgresql.conf
+    regexp: '^port'
+    line: "port = 5432"
+    state: present
+
+- name: Restart PostgreSQL service
+  systemd:
+    state: restarted
+    daemon_reload: yes
+    name: rh-postgresql10-postgresql
+
+- name: Create awx DB
+  become: true
+  become_user: postgres
+  postgresql_db:
+    name: awx
+
+- name: Generate password for awx db user
+  set_fact:
+    password: "{{ lookup('password', '/dev/null length=24 chars=ascii_letters,digits') }}"
+
+- name : Display password for awx db user
+  debug:
+    msg: "Randomly generated password for awx db user is : {{ password }}"
+
+- name: Create awx user for DB
+  become: true
+  become_user: postgres
+  postgresql_user:
+    db: awx
+    name: awx
+    password: "{{ password }}"
